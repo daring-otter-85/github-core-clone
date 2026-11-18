@@ -32,6 +32,44 @@ const RETRY_MAX_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Boot audit, added for the forge entry: the lifecycle above is the harness's, but the entry keeps
+ * its own timed trail of how far startup got, so a trial that dies early still says where it stopped.
+ * The trail lives only in this process and is written to stderr, never to the protocol stdout lines.
+ */
+interface BootMark {
+  event: string;
+  atMs: number;
+}
+
+const bootMarks: BootMark[] = [];
+const BOOT_STARTED_AT = Date.now();
+
+/** Append one named mark to the boot trail, stamped with its offset from process start. */
+function markBoot(event: string): void {
+  bootMarks.push({ event, atMs: Date.now() - BOOT_STARTED_AT });
+}
+
+/** Render the trail as `event@+Nms` pairs in the order the marks were taken. */
+function bootTrail(): string {
+  return bootMarks.map((mark) => `${mark.event}@+${mark.atMs}ms`).join(' ');
+}
+
+/** Milliseconds between two named marks, or -1 when either end of the span was never marked. */
+function bootSpan(from: string, to: string): number {
+  const start = bootMarks.find((mark) => mark.event === from);
+  const end = bootMarks.find((mark) => mark.event === to);
+  if (start === undefined || end === undefined) return -1;
+  return end.atMs - start.atMs;
+}
+
+/** Take the boot mark and say, once, which runtime this entry came up on. */
+function logBootAudit(): void {
+  markBoot('boot');
+  const runtime = `pid=${process.pid} node=${process.version} platform=${process.platform}`;
+  process.stderr.write(`[entry] boot audit: ${runtime}; trail: ${bootTrail()}\n`);
+}
+
 /** The wait after `attempt` failed requests: exponential from RETRY_INITIAL_MS, capped. */
 function retryDelay(attempt: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
@@ -78,6 +116,7 @@ async function waitForDone(): Promise<void> {
 
 /** Bound the port, register it, then wait for the env: the whole life of the process. */
 async function main(): Promise<void> {
+  logBootAudit();
   const server = createApp();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -86,9 +125,12 @@ async function main(): Promise<void> {
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
   process.stdout.write(`[entry] listening on port ${address.port}\n`);
+  markBoot('listening');
 
   await register(address.port);
+  markBoot('registered');
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
+  process.stderr.write(`[entry] boot audit: startup span ${bootSpan('boot', 'registered')}ms; trail: ${bootTrail()}\n`);
 
   await waitForDone();
   server.close();
