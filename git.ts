@@ -23,8 +23,12 @@ export function sha1Hex(data: Buffer): string {
 
 /** The oid of an object: SHA-1 of "<type> <byte length>\0" followed by the raw payload. */
 export function hashObject(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Two updates, not a concat: hashing runs once per stored object, and the concat used to copy
+  // every payload (a full extra pass over large blobs) just to hash it.
+  const hash = createHash('sha1');
+  hash.update(`${type} ${data.length}\0`, 'utf8');
+  hash.update(data);
+  return hash.digest('hex');
 }
 
 /** Store an object and return its oid (idempotent: the same bytes give the same oid). */
@@ -202,7 +206,26 @@ export function ancestorSet(store: ObjectStore, tip: string): Set<string> {
 
 /** True when `ancestor` is `descendant` itself or one of its ancestors. */
 export function isAncestor(store: ObjectStore, ancestor: string, descendant: string): boolean {
-  return ancestorSet(store, descendant).has(ancestor);
+  // Depth-first from the descendant, exiting the moment the ancestor turns up. The old shape
+  // built the descendant's entire ancestor set first, so a fast-forward push — where the
+  // ancestor is the new tip's parent — paid a full-history walk on every receive-pack; now it
+  // pays one step. A push that is not a fast-forward still walks everything, exactly as before.
+  if (ancestor === descendant) {
+    const self = store.get(descendant);
+    return self !== undefined && self.type === 'commit';
+  }
+  const seen = new Set<string>();
+  const stack = [descendant];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (oid === ancestor) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const object = store.get(oid);
+    if (object === undefined || object.type !== 'commit') continue;
+    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** A merge base of two commits: the first commit on a BFS from `b` that is an ancestor of `a`. */
@@ -339,6 +362,24 @@ export function parsePack(buf: Buffer, resolveExternal?: (oid: string) => GitObj
     byOffset.set(start, i);
   }
   const resolved: (GitObject | null)[] = raw.map(() => null);
+  // oid -> raw index over the pack's plain (non-delta) entries, each hashed once on first use.
+  // The ref-delta base hunt used to re-hash every plain entry for every delta in the pack —
+  // quadratic on the delta-heavy packs real git clients send. The map makes a base lookup O(1).
+  let plainIndex: Map<string, number> | null = null;
+  const plainIndexByOid = (): Map<string, number> => {
+    if (plainIndex !== null) return plainIndex;
+    plainIndex = new Map();
+    for (let i = 0; i < raw.length; i++) {
+      const entry = raw[i]!;
+      if (entry.type !== 'ofs-delta' && entry.type !== 'ref-delta') {
+        plainIndex.set(hashObject(entry.type, entry.data), i);
+      }
+    }
+    return plainIndex;
+  };
+  // The oid of each resolved entry, memoized: the delta-base fallback scan below hashes any
+  // given entry at most once per pack instead of once per delta that goes looking.
+  const resolvedOid: (string | null)[] = raw.map(() => null);
   const resolve = (index: number): GitObject => {
     const done = resolved[index];
     if (done !== null) return done;
@@ -351,14 +392,19 @@ export function parsePack(buf: Buffer, resolveExternal?: (oid: string) => GitObj
       object = { type: base.type, data: applyDelta(base.data, entry.data) };
     } else if (entry.type === 'ref-delta') {
       let base: GitObject | undefined;
-      const localIndex = raw.findIndex((candidate, candidateIndex) => candidate.type !== 'ofs-delta' && candidate.type !== 'ref-delta' && resolved[candidateIndex] === null && hashObject(candidate.type as ObjType, candidate.data) === entry.baseOid);
-      if (localIndex >= 0) base = resolve(localIndex);
+      const localIndex = plainIndexByOid().get(entry.baseOid!);
+      if (localIndex !== undefined) base = resolve(localIndex);
       if (base === undefined) {
         // Maybe the base is another delta entry whose resolution yields the oid.
         for (let candidateIndex = 0; candidateIndex < raw.length; candidateIndex++) {
           if (candidateIndex === index) continue;
           const candidate = resolve(candidateIndex);
-          if (hashObject(candidate.type, candidate.data) === entry.baseOid) {
+          let candidateOid = resolvedOid[candidateIndex];
+          if (candidateOid === null) {
+            candidateOid = hashObject(candidate.type, candidate.data);
+            resolvedOid[candidateIndex] = candidateOid;
+          }
+          if (candidateOid === entry.baseOid) {
             base = candidate;
             break;
           }

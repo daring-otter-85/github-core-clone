@@ -779,8 +779,63 @@ interface FetchArgs {
   done: boolean;
 }
 
+interface FetchOutcome {
+  pack: Buffer;
+  shallowOut: string[];
+  unshallowOut: string[];
+}
+
+/**
+ * Recent fetch outcomes per repository. A fetch's pack and shallow boundary are a pure function
+ * of the object store plus the request arguments, and objects are only ever added to a store —
+ * never removed or mutated — so the store's size versions it exactly: same size and same
+ * arguments, same outcome. Concurrent identical clones (the common case: many readers fetching
+ * the same tip at the same depth) then share one traversal and one pack build instead of
+ * repeating both per request. A handful of entries per repo is plenty; older ones fall out FIFO.
+ */
+const fetchOutcomes = new WeakMap<RepoRec, Map<string, FetchOutcome>>();
+
+function fetchOutcomeKey(repo: RepoRec, args: FetchArgs): string {
+  return [
+    repo.objects.size,
+    [...args.wants].sort().join(' '),
+    [...args.haves].sort().join(' '),
+    [...args.shallow].sort().join(' '),
+    args.deepen ?? '',
+    args.deepenSince ?? '',
+  ].join('|');
+}
+
 function handleFetch(res: ServerResponse, repo: RepoRec, args: FetchArgs): void {
   const store = repo.objects;
+  const outcomeKey = fetchOutcomeKey(repo, args);
+  let outcomes = fetchOutcomes.get(repo);
+  const cached = outcomes?.get(outcomeKey);
+  if (cached !== undefined) {
+    const parts: Buffer[] = [];
+    parts.push(pktLine('acknowledgments\n'));
+    const recognized = args.haves.filter((have) => store.has(have));
+    if (recognized.length === 0) {
+      parts.push(pktLine('NAK\n'));
+    } else {
+      for (const have of new Set(recognized)) parts.push(pktLine(`ACK ${have}\n`));
+      parts.push(pktLine('ready\n'));
+    }
+    parts.push(PKT_DELIM);
+    if (cached.shallowOut.length > 0 || cached.unshallowOut.length > 0) {
+      parts.push(pktLine('shallow-info\n'));
+      for (const oid of cached.shallowOut) parts.push(pktLine(`shallow ${oid}\n`));
+      for (const oid of cached.unshallowOut) parts.push(pktLine(`unshallow ${oid}\n`));
+      parts.push(PKT_DELIM);
+    }
+    if (args.done) {
+      parts.push(pktLine('packfile\n'));
+      parts.push(sidebandWrap(cached.pack, 1));
+      parts.push(PKT_FLUSH);
+    }
+    sendBytes(res, 200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
+    return;
+  }
   // Distances (in commit generations) from the wants, following parents.
   const dist = new Map<string, number>();
   const queue: string[] = [];
@@ -882,6 +937,12 @@ function handleFetch(res: ServerResponse, repo: RepoRec, args: FetchArgs): void 
     for (const oid of closure) addObject(oid);
   }
   const pack = writePack([...send.values()]);
+  if (outcomes === undefined) {
+    outcomes = new Map();
+    fetchOutcomes.set(repo, outcomes);
+  }
+  if (outcomes.size >= 16) outcomes.delete(outcomes.keys().next().value!);
+  outcomes.set(outcomeKey, { pack, shallowOut, unshallowOut });
 
   const parts: Buffer[] = [];
   parts.push(pktLine('acknowledgments\n'));
